@@ -25,9 +25,9 @@
     </style>
   </head>
   <body>
-    <p class="eyebrow">sheet-db / transport proof 0.1.0</p>
+    <p class="eyebrow">sheet-db / transport proof 0.2.0</p>
     <h1>Your private connection</h1>
-    <p>Open the test app from this panel. Keep this Sheet and panel open while testing.</p>
+    <p>Open the test app from this panel. Keep this Sheet and panel open while using it. Records are stored as editable spreadsheet rows.</p>
     <form id="connection-form">
       <label for="app-url">Test app address</label>
       <input id="app-url" type="url" placeholder="https://your-app.example/" required autocomplete="off" spellcheck="false">
@@ -40,7 +40,7 @@
       <p id="status">Enter the address shown in the test app’s setup guide.</p>
       <div id="identity"></div>
     </div>
-    <p class="notice">This is a connection experiment using dummy data. No public endpoint is deployed. Google authorization and writes stay in your own script copy.</p>
+    <p class="notice">Edit record values, add rows, or delete record rows in the records tab. Direct edits are checked before the next app read or write. Leave headings, datatypes, IDs and revision columns managed by sheet-db. No public endpoint is deployed; Google authorization stays in your own script copy.</p>
     <script>
       (function () {
         'use strict';
@@ -73,7 +73,7 @@
 
         function send(current, message) {
           if (session !== current || !current.popup || current.popup.closed) return;
-          current.popup.postMessage(Object.assign({ protocol: 1, channel: current.channel }, message), current.origin);
+          current.popup.postMessage(Object.assign({ protocol: 2, channel: current.channel }, message), current.origin);
         }
 
         function connected(current) {
@@ -175,7 +175,7 @@
           var current = session;
           if (!current || event.source !== current.popup || event.origin !== current.origin) return;
           var message = event.data;
-          if (!message || typeof message !== 'object' || message.protocol !== 1 || message.channel !== current.channel) return;
+          if (!message || typeof message !== 'object' || message.protocol !== 2 || message.channel !== current.channel) return;
           if (message.kind === 'ready') {
             if (!current.established) {
               current.ready = true;
@@ -213,6 +213,7 @@
               details: mutation ? {
                 operationId: message.command.operationId,
                 recordId: message.command.recordId,
+                issuedAt: message.command.issuedAt,
                 accountId: current.identity.accountId,
                 databaseId: current.identity.databaseId,
                 retryable: true
@@ -231,7 +232,7 @@
             if (session !== current) return;
             var response = failedRpc(String(error && error.message || 'Google could not complete this request.').slice(0, 400));
             send(current, Object.assign({ kind: 'response', requestId: requestId }, response));
-          }).sheetDbExecute({ protocol: 1, channel: current.channel, requestId: requestId, context: message.context, command: message.command });
+          }).sheetDbExecute({ protocol: 2, channel: current.channel, requestId: requestId, context: message.context, command: message.command });
         });
       }());
     </script>
