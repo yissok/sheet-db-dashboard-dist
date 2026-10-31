@@ -1,0 +1,81 @@
+name: Publish Pages and notify Scout
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: scout-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Skip superseded deployments
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          if [ "$current" = "$GITHUB_SHA" ]; then
+            echo 'deploy=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'A newer distribution commit will deploy; skipping this run.'
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.candidate.outputs.deploy == 'true'
+        with:
+          node-version: 24
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.candidate.outputs.deploy == 'true'
+        with:
+          path: .
+      - name: Deploy GitHub Pages
+        if: steps.candidate.outputs.deploy == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Verify the deployed release and notify Scout
+        id: promotion
+        if: steps.candidate.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCOUT_REPO_PAT: ${{ secrets.SCOUT_REPO_PAT }}
+          RELEASE_WAIT_MS: '60000'
+          RELEASE_VERIFY_SCOPE: 'main'
+        run: node .github/scout/pages-promotion.mjs
+      - name: Keep the current and previous verified releases
+        if: steps.promotion.outputs.cleanup == 'true'
+        env:
+          SCOUT_REPO_PAT: ${{ secrets.SCOUT_REPO_PAT }}
+        run: |
+          # The PAT lets the cleanup commit trigger a Pages redeployment.
+          remote="https://x-access-token:${SCOUT_REPO_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3; do
+            checkout="$RUNNER_TEMP/cleanup-${attempt}"
+            git clone --depth 1 --branch main "$remote" "$checkout"
+            node .github/scout/prune-releases.mjs "$checkout" manifest.json
+            git -C "$checkout" config user.name 'static-app-publisher'
+            git -C "$checkout" config user.email 'static-app-publisher@users.noreply.github.com'
+            git -C "$checkout" add --all
+            if git -C "$checkout" diff --cached --quiet; then break; fi
+            git -C "$checkout" commit -m "Keep current and previous verified releases"
+            if git -C "$checkout" push origin main; then break; fi
+            if [ "$attempt" = 3 ]; then
+              echo "::warning::Cleanup push failed after three attempts; a later deployment will retry."
+            fi
+          done
