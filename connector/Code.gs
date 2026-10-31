@@ -1,11 +1,11 @@
 /**
- * sheet-db 0.2.0 — private current-state tables with deferred direct-edit reconciliation.
+ * sheet-db 0.3.0 — private current-state tables with deferred direct-edit reconciliation.
  * @OnlyCurrentDoc
  * Manual spreadsheet editing does not honor Apps Script locks. Checks detect observable
  * changes; they do not establish transactions with concurrent human editing.
  */
 const SHEET_DB_PROOF_ = Object.freeze({
-  protocol: 2, schema: 2, version: '0.2.0', sheetName: 'records',
+  protocol: 2, schema: 2, version: '0.3.0', sheetName: 'records',
   metaName: '_sheetdb_meta', opsName: '_sheetdb_ops',
   metaHeader: 'sheet-db storage schema 2', opsHeader: 'sheet-db operations schema 2',
   sessionKey: 'sheetdb.connection.v2', initializedKey: 'sheetdb.initialized.v2', initializingKey: 'sheetdb.initializing.v2',
@@ -14,6 +14,10 @@ const SHEET_DB_PROOF_ = Object.freeze({
   headers: ['id', 'label', '_revision', '_status'], types: ['id', 'text', 'integer', 'status'],
   opHeaders: ['operationId', 'issuedAt', 'action', 'recordId', 'requestHash', 'priorRevision', 'priorHash', 'targetRevision', 'targetHash', 'status', 'deleted', 'row']
 });
+
+let SHEET_DB_CURRENT_ = null;
+let SHEET_DB_STATES_ = null;
+function sheetDbConfig_() { return SHEET_DB_CURRENT_ || SHEET_DB_PROOF_; }
 
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('sheet-db').addItem('Open connection panel', 'openSheetDbPanel').addToUi();
@@ -25,13 +29,20 @@ function openSheetDbPanel() {
 /** Best-effort marker only. A full reconciliation runs before every adapter request. */
 function onEdit(event) {
   try {
-    if (!event || !event.range || event.range.getSheet().getName() !== 'records') return;
+    if (!event || !event.range) return;
+    const name = event.range.getSheet().getName();
+    if (name !== 'records') {
+      const schema = sheetDbLoadSchema_();
+      const table = schema && schema.tables.find(function (item) { return item.name === name; });
+      if (!table) return;
+      SHEET_DB_CURRENT_ = sheetDbTableConfig_(table);
+    }
     const first = Math.max(3, event.range.getRow());
     const last = event.range.getRow() + event.range.getNumRows() - 1;
-    if (last < first) return;
-    event.range.getSheet().getRange(first, 4, last - first + 1, 1)
+    if (last >= first) event.range.getSheet().getRange(first, sheetDbConfig_().headers.length, last - first + 1, 1)
       .setValues(Array.from({ length: last - first + 1 }, function () { return ['Pending']; }));
-  } catch (_) { /* Trigger queue/delivery is not an authoritative change log. */ }
+  } catch (_) { /* Markers are best effort; each operation scans the tables. */ }
+  finally { SHEET_DB_CURRENT_ = null; }
 }
 
 function sheetDbPrepareConnection(input) {
@@ -43,8 +54,8 @@ function sheetDbPrepareConnection(input) {
     sheetDbAssert_(Number.isFinite(input.expiresAt) && input.expiresAt > now && input.expiresAt <= now + 5 * 60 * 1000,
       'CONNECTION_EXPIRED', 'This connection invitation has expired. Open the app again.');
     const identity = sheetDbIdentity_();
-    const sessionExpiresAt = now + SHEET_DB_PROOF_.sessionDuration;
-    PropertiesService.getUserProperties().setProperty(SHEET_DB_PROOF_.sessionKey, JSON.stringify({
+    const sessionExpiresAt = now + sheetDbConfig_().sessionDuration;
+    PropertiesService.getUserProperties().setProperty(sheetDbConfig_().sessionKey, JSON.stringify({
       channel: input.channel, appOrigin: input.appOrigin, accountId: identity.accountId,
       databaseId: identity.databaseId, expiresAt: sessionExpiresAt
     }));
@@ -57,13 +68,14 @@ function sheetDbExecute(request) {
     sheetDbAssert_(request && typeof request === 'object', 'VALIDATION_ERROR', 'The request is missing.');
     sheetDbAssert_(request.protocol === 2, 'PROTOCOL_MISMATCH', 'Update the app and connector to compatible versions.');
     const identity = sheetDbIdentity_();
-    const encoded = PropertiesService.getUserProperties().getProperty(SHEET_DB_PROOF_.sessionKey);
+    const encoded = PropertiesService.getUserProperties().getProperty(sheetDbConfig_().sessionKey);
     let session;
     try { session = encoded ? JSON.parse(encoded) : null; } catch (_) { session = null; }
     sheetDbAssert_(session && session.channel === request.channel && session.expiresAt > Date.now(), 'CONNECTION_EXPIRED', 'Open the connection panel and connect the app again.');
     sheetDbAssert_(session.accountId === identity.accountId && session.databaseId === identity.databaseId && request.context &&
       request.context.accountId === identity.accountId && request.context.databaseId === identity.databaseId,
       'IDENTITY_MISMATCH', 'The account or database changed. Reconnect before trying again.');
+    if (request.command && (request.command.action === 'ensureSchema' || request.command.table)) return sheetDbTableRequest_(request.command);
     const command = sheetDbCommand_(request.command);
     const lock = LockService.getDocumentLock();
     sheetDbAssert_(lock && lock.tryLock(5000), 'BUSY', 'The database is busy. Retry the same request.', { retryable: true });
@@ -90,7 +102,7 @@ function sheetDbIdentity_() {
   sheetDbAssert_(!active || active === effective, 'IDENTITY_MISMATCH', 'Google returned different active and authorized accounts. Use a browser profile signed into only the Sheet owner.');
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   sheetDbAssert_(spreadsheet, 'IDENTITY_UNAVAILABLE', 'Open this connector from its own Google Sheet.');
-  return { accountId: effective, accountEmail: effective, databaseId: spreadsheet.getId(), databaseName: spreadsheet.getName(), protocolVersion: 2, schemaVersion: 2, connectorVersion: '0.2.0' };
+  return { accountId: effective, accountEmail: effective, databaseId: spreadsheet.getId(), databaseName: spreadsheet.getName(), protocolVersion: 2, schemaVersion: 2, connectorVersion: '0.3.0', tableApiVersion: 1 };
 }
 
 function sheetDbCommand_(input) {
@@ -102,7 +114,7 @@ function sheetDbCommand_(input) {
     allowed.operationId = allowed.issuedAt = true;
     sheetDbAssert_(typeof input.operationId === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(input.operationId), 'VALIDATION_ERROR', 'A stable operation code is required.');
     sheetDbAssert_(Number.isSafeInteger(input.issuedAt), 'VALIDATION_ERROR', 'The original operation time is required.');
-    sheetDbAssert_(input.issuedAt > Date.now() - SHEET_DB_PROOF_.receiptDuration && input.issuedAt <= Date.now() + 60000,
+    sheetDbAssert_(input.issuedAt > Date.now() - sheetDbConfig_().receiptDuration && input.issuedAt <= Date.now() + 60000,
       'RETRY_EXPIRED', 'This operation is too old or has an invalid time. Read the current database before creating a new operation.');
     command.operationId = input.operationId; command.issuedAt = input.issuedAt;
   }
@@ -118,10 +130,8 @@ function sheetDbCommand_(input) {
   }
   if (action === 'create' || action === 'update') {
     allowed.data = true;
-    sheetDbAssert_(input.data && typeof input.data === 'object' && !Array.isArray(input.data) && Object.keys(input.data).length === 1 &&
-      typeof input.data.label === 'string' && input.data.label.trim() && input.data.label.length <= 500 && !/^=/.test(input.data.label),
-      'VALIDATION_ERROR', 'Enter a text label between 1 and 500 characters. Formula expressions are not supported.');
-    command.data = { label: input.data.label };
+    command.data = sheetDbValidateData_(input.data);
+
   }
   sheetDbAssert_(Object.keys(input).every(function (key) { return Object.prototype.hasOwnProperty.call(allowed, key); }), 'VALIDATION_ERROR', 'The command contains unsupported fields.');
   return command;
@@ -131,37 +141,37 @@ function sheetDbStorage_() {
   const book = SpreadsheetApp.getActiveSpreadsheet();
   sheetDbAssert_(!book.getSheetByName('_sheetdb_proof_v1'), 'UPGRADE_REQUIRED',
     'This Sheet contains the old audit journal. Keep it unchanged and install connector 0.2.0 in a new blank private Sheet. Automatic migration is not available.');
-  let table = book.getSheetByName('records'), meta = book.getSheetByName('_sheetdb_meta'), ops = book.getSheetByName('_sheetdb_ops');
+  let table = book.getSheetByName(sheetDbConfig_().sheetName), meta = book.getSheetByName(sheetDbConfig_().metaName), ops = book.getSheetByName(sheetDbConfig_().opsName);
   const properties = PropertiesService.getDocumentProperties();
-  const initialized = properties.getProperty(SHEET_DB_PROOF_.initializedKey);
+  const initialized = properties.getProperty(sheetDbConfig_().initializedKey);
   if (!table && !meta && !ops && initialized !== book.getId()) {
     // Persist ownership of empty initialization before the first worksheet mutation.
-    properties.setProperty(SHEET_DB_PROOF_.initializingKey, book.getId());
-    sheetDbAssert_(properties.getProperty(SHEET_DB_PROOF_.initializingKey) === book.getId(),
+    properties.setProperty(sheetDbConfig_().initializingKey, book.getId());
+    sheetDbAssert_(properties.getProperty(sheetDbConfig_().initializingKey) === book.getId(),
       'SCHEMA_CHANGED', 'Database setup could not be started safely. Retry in a new blank private Sheet.');
   }
-  if (properties.getProperty(SHEET_DB_PROOF_.initializingKey) === book.getId()) {
+  if (properties.getProperty(sheetDbConfig_().initializingKey) === book.getId()) {
     const initializedStorage = sheetDbInitialize_(book, properties);
     table = initializedStorage.table; meta = initializedStorage.meta; ops = initializedStorage.ops;
   }
   sheetDbAssert_(table && meta && ops, 'SCHEMA_CHANGED', 'A managed table or supporting tab was removed. Restore its original structure before continuing.');
-  sheetDbHeaders_(table, [SHEET_DB_PROOF_.headers, SHEET_DB_PROOF_.types], 4, 'SCHEMA_CHANGED');
-  sheetDbAssert_(meta.getRange(1, 1).getValue() === SHEET_DB_PROOF_.metaHeader && ops.getRange(1, 1).getValue() === SHEET_DB_PROOF_.opsHeader,
+  sheetDbHeaders_(table, [sheetDbConfig_().headers, sheetDbConfig_().types], sheetDbConfig_().headers.length, 'SCHEMA_CHANGED');
+  sheetDbAssert_(meta.getRange(1, 1).getValue() === sheetDbConfig_().metaHeader && ops.getRange(1, 1).getValue() === sheetDbConfig_().opsHeader,
     'SCHEMA_CHANGED', 'The storage schema was changed. Restore the supporting tabs.');
   sheetDbHeaders_(meta, [['id', 'revision', 'hash']], 3, 'SCHEMA_CHANGED', 2);
-  sheetDbHeaders_(ops, [SHEET_DB_PROOF_.opHeaders], 12, 'SCHEMA_CHANGED', 2);
+  sheetDbHeaders_(ops, [sheetDbConfig_().opHeaders], 12, 'SCHEMA_CHANGED', 2);
   const storage = { table: table, meta: meta, ops: ops };
   if (meta.getRange(1, 2).getValue() !== book.getId()) sheetDbAdoptCopy_(storage, book.getId());
-  properties.setProperty(SHEET_DB_PROOF_.initializedKey, book.getId());
+  properties.setProperty(sheetDbConfig_().initializedKey, book.getId());
   return storage;
 }
 
 /** Resume only our own empty, interrupted setup. Never adopt user records as setup data. */
 function sheetDbInitialize_(book, properties) {
   const definitions = [
-    { name: 'records', expected: [SHEET_DB_PROOF_.headers, SHEET_DB_PROOF_.types], columns: 4 },
-    { name: '_sheetdb_meta', expected: [[SHEET_DB_PROOF_.metaHeader, book.getId(), ''], ['id', 'revision', 'hash']], columns: 3 },
-    { name: '_sheetdb_ops', expected: [[SHEET_DB_PROOF_.opsHeader].concat(Array(11).fill('')), SHEET_DB_PROOF_.opHeaders], columns: 12 }
+    { name: sheetDbConfig_().sheetName, expected: [sheetDbConfig_().headers, sheetDbConfig_().types], columns: sheetDbConfig_().headers.length },
+    { name: sheetDbConfig_().metaName, expected: [[sheetDbConfig_().metaHeader, book.getId(), ''], ['id', 'revision', 'hash']], columns: 3 },
+    { name: sheetDbConfig_().opsName, expected: [[sheetDbConfig_().opsHeader].concat(Array(11).fill('')), sheetDbConfig_().opHeaders], columns: 12 }
   ];
   // Check every existing tab before creating/filling anything. Unknown data stays untouched.
   definitions.forEach(function (definition) {
@@ -175,13 +185,13 @@ function sheetDbInitialize_(book, properties) {
     sheet.getRange(1, 1, 2, definition.columns).setValues(definition.expected);
     sheets[definition.name] = sheet;
   });
-  const table = sheets.records, meta = sheets._sheetdb_meta, ops = sheets._sheetdb_ops;
-  if (table.getMaxRows() < SHEET_DB_PROOF_.maxRecords + 2)
-    table.insertRowsAfter(table.getMaxRows(), SHEET_DB_PROOF_.maxRecords + 2 - table.getMaxRows());
-  table.getRange(3, 2, table.getMaxRows() - 2, 1).setNumberFormat('@');
+  const table = sheets[sheetDbConfig_().sheetName], meta = sheets[sheetDbConfig_().metaName], ops = sheets[sheetDbConfig_().opsName];
+  if (table.getMaxRows() < sheetDbConfig_().maxRecords + 2)
+    table.insertRowsAfter(table.getMaxRows(), sheetDbConfig_().maxRecords + 2 - table.getMaxRows());
+  sheetDbFormatFields_(table, 3, table.getMaxRows() - 2);
   if (table.setFrozenRows) table.setFrozenRows(2);
-  sheetDbProtect_(table.getRange(1, 1, 2, 4), 'Field names and types are managed by sheet-db.');
-  [1, 3, 4].forEach(function (column) {
+  sheetDbProtect_(table.getRange(1, 1, 2, sheetDbConfig_().headers.length), 'Field names and types are managed by sheet-db.');
+  [1, sheetDbConfig_().headers.length - 1, sheetDbConfig_().headers.length].forEach(function (column) {
     sheetDbProtect_(table.getRange(3, column, table.getMaxRows() - 2, 1), 'Managed sheet-db ID, revision or status. Edit record values instead.');
   });
   if (meta.hideSheet) meta.hideSheet(); if (ops.hideSheet) ops.hideSheet();
@@ -192,8 +202,8 @@ function sheetDbInitialize_(book, properties) {
     sheetDbAssert_(sheet.getLastRow() === 2, 'SCHEMA_CHANGED',
       'A record was added before database setup finished. Keep this Sheet unchanged and use a new blank private Sheet.');
   });
-  properties.setProperty(SHEET_DB_PROOF_.initializedKey, book.getId());
-  properties.deleteProperty(SHEET_DB_PROOF_.initializingKey);
+  properties.setProperty(sheetDbConfig_().initializedKey, book.getId());
+  properties.deleteProperty(sheetDbConfig_().initializingKey);
   return { table: table, meta: meta, ops: ops };
 }
 function sheetDbInitializationEmpty_(sheet, definition) {
@@ -248,7 +258,7 @@ function sheetDbCells_(sheet, columns) {
 }
 function sheetDbWrite_(sheet, row, values) {
   if (row > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), row - sheet.getMaxRows());
-  if (sheet.getName() === 'records') sheet.getRange(row, 2).setNumberFormat('@');
+  if (sheet.getName() === sheetDbConfig_().sheetName) sheetDbFormatFields_(sheet, row, 1);
   sheet.getRange(row, 1, 1, values.length).setValues([values]);
   SpreadsheetApp.flush();
   sheetDbAssert_(JSON.stringify(sheet.getRange(row, 1, 1, values.length).getValues()[0]) === JSON.stringify(values),
@@ -273,16 +283,31 @@ function sheetDbRemoveBaseline_(storage, id) {
   if (current) { storage.meta.deleteRow(current.row); SpreadsheetApp.flush(); }
 }
 function sheetDbReadRows_(storage) {
-  const values = sheetDbCells_(storage.table, 4), result = [];
-  const formulas = values.length ? storage.table.getRange(3, 1, values.length, 4).getFormulas() : [];
+  const columns = sheetDbConfig_().headers.length;
+  const values = sheetDbCells_(storage.table, columns), result = [];
+  const formulas = values.length ? storage.table.getRange(3, 1, values.length, columns).getFormulas() : [];
   values.forEach(function (cells, index) {
-    if (cells.slice(0, 3).every(function (value) { return value === ''; })) return;
-    result.push({ row: index + 3, id: cells[0], label: cells[1], revision: cells[2], status: cells[3],
-      hash: typeof cells[1] === 'string' ? sheetDbHash_(cells[1]) : '', formula: (formulas[index] || []).some(Boolean) });
+    if (cells.slice(0, -1).every(function (value) { return value === ''; })) return;
+    const data = {};
+    sheetDbFields_().forEach(function (field, column) { data[field.name] = cells[column + 1]; });
+    const label = SHEET_DB_CURRENT_ ? data : data.label;
+    result.push({ row: index + 3, id: cells[0], label: label, data: data, revision: cells[columns - 2], status: cells[columns - 1],
+      hash: sheetDbDataHash_(label), formula: (formulas[index] || []).some(Boolean) });
   });
   return result;
 }
-function sheetDbRecord_(row) { return { id: row.id, revision: row.revision, data: { label: row.label }, deleted: false }; }
+function sheetDbRecord_(row) { return { id: row.id, revision: row.revision, data: row.data || { label: row.label }, deleted: false }; }
+function sheetDbFields_() { return sheetDbConfig_().fields || [{ name: 'label', type: 'text', required: true }]; }
+function sheetDbDataHash_(value) { return sheetDbHash_(typeof value === 'string' ? value : JSON.stringify(value)); }
+function sheetDbRowValues_(id, data, revision) {
+  return [id].concat(sheetDbFields_().map(function (field) { return data[field.name]; }), [revision, '']);
+}
+function sheetDbFormatFields_(table, row, count) {
+  sheetDbFields_().forEach(function (field, index) {
+    if (['text', 'reference', 'date'].indexOf(field.type) !== -1) table.getRange(row, index + 2, count, 1).setNumberFormat('@');
+  });
+}
+
 function sheetDbFingerprint_(rows) {
   return sheetDbHash_(JSON.stringify(rows.map(function (row) { return [row.row, row.id, row.label, row.revision, row.formula]; })));
 }
@@ -293,24 +318,26 @@ function sheetDbStable_(storage, expected) {
 function sheetDbIssue_(storage, row, field, message, issues) {
   issues.push({ row: row.row, field: field, message: message });
   try {
-    storage.table.getRange(row.row, 4).setValue('Needs attention');
-    const range = storage.table.getRange(row.row, field === 'label' ? 2 : field === '_revision' ? 3 : 1);
+    storage.table.getRange(row.row, sheetDbConfig_().headers.length).setValue('Needs attention');
+    const range = storage.table.getRange(row.row, field === '_revision' ? sheetDbConfig_().headers.length - 1 : Math.max(1, sheetDbConfig_().headers.indexOf(field) + 1));
     if (range.setBackground) range.setBackground('#fff0d6');
     if (range.setNote) range.setNote(message);
   } catch (_) { /* The structured validation error remains authoritative. */ }
 }
 
 function sheetDbReconcile_(storage) {
-  sheetDbCells_(storage.table, 4).forEach(function (cells, index) {
-    if (cells.slice(0, 3).every(function (value) { return value === ''; }) && cells[3])
-      storage.table.getRange(index + 3, 4).setValue('');
+  sheetDbCells_(storage.table, sheetDbConfig_().headers.length).forEach(function (cells, index) {
+    if (cells.slice(0, -1).every(function (value) { return value === ''; }) && cells[cells.length - 1])
+      storage.table.getRange(index + 3, sheetDbConfig_().headers.length).setValue('');
   });
   let rows = sheetDbReadRows_(storage);
   const baseline = sheetDbBaselines_(storage), byId = Object.create(null), issues = [];
   const missing = Object.keys(baseline).filter(function (id) { return !rows.some(function (row) { return row.id === id; }); });
   rows.forEach(function (row) {
-    if (row.formula || typeof row.label !== 'string' || !row.label.trim() || row.label.length > 500 || /^=/.test(row.label))
-      sheetDbIssue_(storage, row, 'label', 'Use text between 1 and 500 characters; formulas are not supported.', issues);
+    try {
+      sheetDbAssert_(!row.formula, 'VALIDATION_ERROR', 'Formulas are not supported in records.');
+      sheetDbValidateData_(row.data);
+    } catch (error) { sheetDbIssue_(storage, row, error.sheetDbDetails && error.sheetDbDetails.field || 'label', error.message, issues); }
     if (row.id === '') {
       if (row.revision !== '') sheetDbIssue_(storage, row, '_revision', 'Leave managed revisions blank on a new row.', issues);
     } else {
@@ -321,7 +348,7 @@ function sheetDbReconcile_(storage) {
       byId[row.id] = row;
     }
   });
-  sheetDbAssert_(rows.length <= SHEET_DB_PROOF_.maxRecords, 'LIMIT_EXCEEDED', 'This release supports at most 1,000 current records.');
+  sheetDbAssert_(rows.length <= sheetDbConfig_().maxRecords, 'LIMIT_EXCEEDED', 'This table supports at most ' + sheetDbConfig_().maxRecords + ' current records.');
   sheetDbAssert_(!issues.length, 'MANUAL_EDIT_INVALID', 'Fix the highlighted spreadsheet cells before this request can continue.', { issues: issues });
   sheetDbStable_(storage, rows);
   // A missing physical row is a deletion; its current metadata is removed, not archived.
@@ -336,13 +363,13 @@ function sheetDbReconcile_(storage) {
         requestHash: row.hash, priorRevision: previous ? previous.revision : 0, priorHash: previous ? previous.hash : '',
         targetRevision: previous ? previous.revision + 1 : 1, targetHash: row.hash, status: 'PREPARED', deleted: false, row: row.row
       };
-      sheetDbAssert_(sheetDbReceipts_(storage).length < SHEET_DB_PROOF_.maxReceipts, 'LIMIT_EXCEEDED',
+      sheetDbAssert_(sheetDbReceipts_(storage).length < sheetDbConfig_().maxReceipts, 'LIMIT_EXCEEDED',
         'The 24-hour retry receipt limit has been reached. Pending spreadsheet edits are unchanged; wait for old receipts to expire.');
       try {
         sheetDbSaveReceipt_(storage, receipt);
         // Only managed cells change; the user's actual label is never overwritten here.
         storage.table.getRange(row.row, 1).setValue(id);
-        storage.table.getRange(row.row, 3, 1, 2).setValues([[receipt.targetRevision, '']]);
+        storage.table.getRange(row.row, sheetDbConfig_().headers.length - 1, 1, 2).setValues([[receipt.targetRevision, '']]);
         SpreadsheetApp.flush();
         const current = sheetDbReadRows_(storage).filter(function (entry) { return entry.id === id; });
         sheetDbAssert_(current.length === 1 && current[0].hash === receipt.targetHash && current[0].revision === receipt.targetRevision,
@@ -355,7 +382,7 @@ function sheetDbReconcile_(storage) {
       }
       rows = sheetDbReadRows_(storage);
     }
-    sheetDbClearMarks_(storage, row.row);
+    if (row.status || !previous || previous.hash !== row.hash) sheetDbClearMarks_(storage, row.row);
   });
   rows = sheetDbReadRows_(storage);
   sheetDbStable_(storage, rows);
@@ -371,19 +398,19 @@ function sheetDbReconcile_(storage) {
 }
 
 function sheetDbClearMarks_(storage, row) {
-  storage.table.getRange(row, 4).setValue('');
-  const cells = storage.table.getRange(row, 1, 1, 3);
+  storage.table.getRange(row, sheetDbConfig_().headers.length).setValue('');
+  const cells = storage.table.getRange(row, 1, 1, sheetDbConfig_().headers.length - 1);
   if (cells.setBackground) cells.setBackground(null);
   if (cells.setNote) cells.setNote('');
 }
 
 function sheetDbReceiptValues_(receipt) {
-  return SHEET_DB_PROOF_.opHeaders.map(function (key) { return receipt[key] === undefined ? '' : receipt[key]; });
+  return sheetDbConfig_().opHeaders.map(function (key) { return receipt[key] === undefined ? '' : receipt[key]; });
 }
 function sheetDbReceipts_(storage) {
   return sheetDbCells_(storage.ops, 12).map(function (values, index) {
     const receipt = { storageRow: index + 3 };
-    SHEET_DB_PROOF_.opHeaders.forEach(function (key, column) { receipt[key] = values[column]; });
+    sheetDbConfig_().opHeaders.forEach(function (key, column) { receipt[key] = values[column]; });
     sheetDbAssert_(receipt.operationId && ['PREPARED', 'APPLIED'].indexOf(receipt.status) !== -1 && Number.isSafeInteger(receipt.issuedAt),
       'STORAGE_CORRUPT', 'The retry metadata is invalid.');
     return receipt;
@@ -394,7 +421,7 @@ function sheetDbSaveReceipt_(storage, receipt) {
   const existing = receipts.filter(function (entry) { return entry.operationId === receipt.operationId; })[0];
   if (existing) receipt.storageRow = existing.storageRow;
   else {
-    sheetDbAssert_(receipts.length < SHEET_DB_PROOF_.maxReceipts, 'LIMIT_EXCEEDED',
+    sheetDbAssert_(receipts.length < sheetDbConfig_().maxReceipts, 'LIMIT_EXCEEDED',
       'The 24-hour retry receipt limit has been reached. Wait for old receipts to expire before making another change.');
     receipt.storageRow = Math.max(3, storage.ops.getLastRow() + 1);
   }
@@ -409,7 +436,7 @@ function sheetDbAck_(receipt) {
 }
 function sheetDbPrune_(storage) {
   sheetDbReceipts_(storage).reverse().forEach(function (receipt) {
-    if (receipt.status === 'APPLIED' && receipt.issuedAt <= Date.now() - SHEET_DB_PROOF_.receiptDuration)
+    if (receipt.status === 'APPLIED' && receipt.issuedAt <= Date.now() - sheetDbConfig_().receiptDuration)
       storage.ops.deleteRow(receipt.storageRow);
   });
   SpreadsheetApp.flush();
@@ -426,7 +453,7 @@ function sheetDbRecover_(storage) {
       const candidate = rows.filter(function (row) { return row.row === receipt.row && row.id === '' && row.revision === '' && row.hash === receipt.targetHash && !row.formula; });
       sheetDbAssert_(candidate.length === 1, 'RECOVERY_REQUIRED', 'An interrupted new spreadsheet row is ambiguous. Keep the Sheet unchanged for inspection.');
       storage.table.getRange(candidate[0].row, 1).setValue(receipt.recordId);
-      storage.table.getRange(candidate[0].row, 3).setValue(receipt.targetRevision);
+      storage.table.getRange(candidate[0].row, sheetDbConfig_().headers.length - 1).setValue(receipt.targetRevision);
       SpreadsheetApp.flush();
       current = sheetDbReadRows_(storage).filter(function (row) { return row.id === receipt.recordId; });
     }
@@ -437,7 +464,7 @@ function sheetDbRecover_(storage) {
       sheetDbAssert_(current.length === 1 && !current[0].formula && current[0].hash === receipt.targetHash,
         'RECOVERY_REQUIRED', 'An interrupted write has an uncertain outcome. Keep the Sheet unchanged for inspection.');
       if (manual && (current[0].revision === receipt.priorRevision || (receipt.action === 'manual-create' && current[0].revision === ''))) {
-        storage.table.getRange(current[0].row, 3).setValue(receipt.targetRevision); SpreadsheetApp.flush();
+        storage.table.getRange(current[0].row, sheetDbConfig_().headers.length - 1).setValue(receipt.targetRevision); SpreadsheetApp.flush();
         current = sheetDbReadRows_(storage).filter(function (row) { return row.id === receipt.recordId; });
       }
       sheetDbAssert_(current[0].revision === receipt.targetRevision, 'RECOVERY_REQUIRED', 'The interrupted write revision is ambiguous.');
@@ -459,20 +486,21 @@ function sheetDbMutate_(storage, state, command) {
   const current = state.byId[command.recordId];
   if (command.action === 'create') {
     sheetDbAssert_(!current, 'ALREADY_EXISTS', 'This record ID already exists.');
-    sheetDbAssert_(state.rows.length < SHEET_DB_PROOF_.maxRecords, 'LIMIT_EXCEEDED', 'This release supports at most 1,000 current records.');
+    sheetDbAssert_(state.rows.length < sheetDbConfig_().maxRecords, 'LIMIT_EXCEEDED', 'This table supports at most ' + sheetDbConfig_().maxRecords + ' current records.');
   } else {
     sheetDbAssert_(current, 'NOT_FOUND', 'This record does not exist.');
     sheetDbAssert_(current.revision === command.expectedRevision, 'REVISION_CONFLICT', 'The record changed. Read its current revision before editing.', { currentRevision: current.revision });
   }
+  if (SHEET_DB_STATES_) sheetDbValidateMutation_(storage, state, command);
   sheetDbStable_(storage, state.rows);
   const receipt = {
     operationId: command.operationId, issuedAt: command.issuedAt, action: command.action, recordId: command.recordId,
     requestHash: signature, priorRevision: current ? current.revision : 0, priorHash: current ? current.hash : '',
-    targetRevision: current ? current.revision + 1 : 1, targetHash: command.action === 'delete' ? '' : sheetDbHash_(command.data.label),
+    targetRevision: current ? current.revision + 1 : 1, targetHash: command.action === 'delete' ? '' : sheetDbDataHash_(SHEET_DB_CURRENT_ ? command.data : command.data.label),
     status: 'PREPARED', deleted: command.action === 'delete', row: current ? current.row : Math.max(3, storage.table.getLastRow() + 1)
   };
   // Capacity is known before dispatch; a full receipt table is not an uncertain write.
-  sheetDbAssert_(sheetDbReceipts_(storage).length < SHEET_DB_PROOF_.maxReceipts, 'LIMIT_EXCEEDED',
+  sheetDbAssert_(sheetDbReceipts_(storage).length < sheetDbConfig_().maxReceipts, 'LIMIT_EXCEEDED',
     'The 24-hour retry receipt limit has been reached. Wait for old receipts to expire.');
   // Persist a payload-free intent before touching the record. Ambiguous interruption fails closed.
   let attemptedRecordWrite = false;
@@ -481,7 +509,7 @@ function sheetDbMutate_(storage, state, command) {
     sheetDbStable_(storage, state.rows);
     attemptedRecordWrite = true;
     if (receipt.deleted) { storage.table.deleteRow(current.row); SpreadsheetApp.flush(); }
-    else sheetDbWrite_(storage.table, receipt.row, [receipt.recordId, command.data.label, receipt.targetRevision, '']);
+    else sheetDbWrite_(storage.table, receipt.row, sheetDbRowValues_(receipt.recordId, command.data, receipt.targetRevision));
     const confirmed = sheetDbReadRows_(storage).filter(function (row) { return row.id === receipt.recordId; });
     sheetDbAssert_(receipt.deleted ? !confirmed.length : confirmed.length === 1 && !confirmed[0].formula &&
       confirmed[0].hash === receipt.targetHash && confirmed[0].revision === receipt.targetRevision,
@@ -518,4 +546,190 @@ function sheetDbSafe_(work) {
 function sheetDbAssert_(condition, code, message, details) { if (!condition) sheetDbFail_(code, message, details); }
 function sheetDbFail_(code, message, details) {
   const error = new Error(message); error.sheetDbCode = code; error.sheetDbDetails = details; throw error;
+}
+
+// Generic app-declared schema. No application tables, hours or booking rules live here.
+function sheetDbAllowed_(value, keys) {
+  sheetDbAssert_(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(function (key) { return keys.indexOf(key) !== -1; }),
+    'VALIDATION_ERROR', 'Unsupported schema or record options.');
+}
+function sheetDbNormalizeSchema_(schema) {
+  sheetDbAllowed_(schema, ['name', 'version', 'tables']);
+  const name = function (value) { return typeof value === 'string' && /^[a-z][a-zA-Z0-9_]{0,31}$/.test(value) && ['records', 'constructor', 'prototype', 'id'].indexOf(value) === -1; };
+  sheetDbAssert_(name(schema.name) && Number.isSafeInteger(schema.version) && schema.version > 0 && Array.isArray(schema.tables) && schema.tables.length > 0 && schema.tables.length <= 8,
+    'VALIDATION_ERROR', 'Declare a named, versioned schema with one to eight tables.');
+  const names = Object.create(null);
+  const tables = schema.tables.map(function (table) {
+    sheetDbAllowed_(table, ['name', 'fields', 'unique', 'maxRecords']);
+    sheetDbAssert_(name(table.name) && !names[table.name.toLowerCase()] && Array.isArray(table.fields) && table.fields.length > 0 && table.fields.length <= 12,
+      'VALIDATION_ERROR', 'Table names must be distinct and have one to twelve fields.');
+    names[table.name.toLowerCase()] = true;
+    const fields = table.fields.map(function (field) {
+      sheetDbAllowed_(field, ['name', 'type', 'required', 'min', 'max', 'choices', 'reference', 'when']);
+      sheetDbAssert_(name(field.name) && ['text', 'integer', 'number', 'boolean', 'reference', 'date'].indexOf(field.type) !== -1,
+        'VALIDATION_ERROR', 'Unsupported field name or type.');
+      sheetDbAssert_(field.required === undefined || typeof field.required === 'boolean', 'VALIDATION_ERROR', 'required must be a boolean.');
+      sheetDbAssert_(field.type !== 'reference' || typeof field.reference === 'string', 'VALIDATION_ERROR', 'Reference fields need a target table.');
+      sheetDbAssert_(field.when === undefined || field.reference !== undefined, 'VALIDATION_ERROR', 'Field conditions apply to references.');
+      const result = { name: field.name, type: field.type, required: field.required === true };
+      ['min', 'max'].forEach(function (key) {
+        if (field[key] !== undefined) {
+          sheetDbAssert_(['integer', 'number'].indexOf(field.type) !== -1 && Number.isFinite(field[key]), 'VALIDATION_ERROR', 'Numeric bounds require numeric fields.');
+          result[key] = field[key];
+        }
+      });
+      sheetDbAssert_(result.min === undefined || result.max === undefined || result.min <= result.max, 'VALIDATION_ERROR', 'Invalid numeric bounds.');
+      if (field.choices !== undefined) {
+        sheetDbAssert_(Array.isArray(field.choices) && field.choices.length > 0 && field.choices.length <= 20 && field.choices.every(function (value) { return ['string', 'number', 'boolean'].indexOf(typeof value) !== -1; }), 'VALIDATION_ERROR', 'Invalid allowed values.');
+        result.choices = field.choices;
+      }
+      if (field.reference !== undefined) { sheetDbAssert_(field.type === 'reference' && name(field.reference), 'VALIDATION_ERROR', 'Invalid reference.'); result.reference = field.reference; }
+      if (field.when !== undefined) result.when = sheetDbPredicate_(field.when);
+      return result;
+    });
+    sheetDbAssert_(new Set(fields.map(function (field) { return field.name; })).size === fields.length, 'VALIDATION_ERROR', 'Field names must be distinct.');
+    sheetDbAssert_(table.unique === undefined || Array.isArray(table.unique) && table.unique.length <= 12, 'VALIDATION_ERROR', 'Invalid unique constraints.');
+    const unique = (table.unique || []).map(function (rule) {
+      sheetDbAllowed_(rule, ['fields', 'when']);
+      sheetDbAssert_(Array.isArray(rule.fields) && rule.fields.length > 0 && rule.fields.every(function (field) { return fields.some(function (item) { return item.name === field; }); }), 'VALIDATION_ERROR', 'Invalid unique constraint.');
+      return { fields: rule.fields, ...(rule.when ? { when: sheetDbPredicate_(rule.when) } : {}) };
+    });
+    const maxRecords = table.maxRecords === undefined ? 1000 : table.maxRecords;
+    sheetDbAssert_(Number.isSafeInteger(maxRecords) && maxRecords >= 1 && maxRecords <= 1000, 'VALIDATION_ERROR', 'Invalid record limit.');
+    fields.concat(unique).forEach(function (rule) {
+      if (rule.when) sheetDbAssert_(fields.some(function (field) { return field.name === rule.when.field; }), 'VALIDATION_ERROR', 'Unknown condition field.');
+    });
+    return { name: table.name, fields: fields, unique: unique, maxRecords: maxRecords };
+  });
+  tables.forEach(function (table) { table.fields.forEach(function (field) {
+    if (field.reference) sheetDbAssert_(tables.some(function (target) { return target.name === field.reference; }), 'VALIDATION_ERROR', 'Reference target is undeclared.');
+  }); });
+  const result = { name: schema.name, version: schema.version, tables: tables };
+  sheetDbAssert_(encodeURIComponent(JSON.stringify(result)).replace(/%[A-F0-9]{2}|./g, 'x').length <= 8000, 'LIMIT_EXCEEDED', 'The schema exceeds this release’s configuration limit.');
+  return result;
+}
+function sheetDbPredicate_(condition) {
+  sheetDbAllowed_(condition, ['field', 'equals']);
+  sheetDbAssert_(typeof condition.field === 'string' && ['string', 'number', 'boolean'].indexOf(typeof condition.equals) !== -1, 'VALIDATION_ERROR', 'Invalid condition.');
+  return { field: condition.field, equals: condition.equals };
+}
+function sheetDbLoadSchema_() {
+  const text = PropertiesService.getDocumentProperties().getProperty('sheetdb.applicationSchema.v1');
+  if (!text) return null;
+  try { return sheetDbNormalizeSchema_(JSON.parse(text)); }
+  catch (_) { sheetDbFail_('SCHEMA_CHANGED', 'The application schema is unreadable. Restore its configuration before continuing.'); }
+}
+function sheetDbTableConfig_(table) {
+  return Object.assign({}, SHEET_DB_PROOF_, {
+    sheetName: table.name, metaName: '_sheetdb_' + table.name + '_meta', opsName: '_sheetdb_' + table.name + '_ops',
+    initializedKey: 'sheetdb.initialized.v2.' + table.name, initializingKey: 'sheetdb.initializing.v2.' + table.name,
+    headers: ['id'].concat(table.fields.map(function (field) { return field.name; }), ['_revision', '_status']),
+    types: ['id'].concat(table.fields.map(function (field) { return field.type; }), ['integer', 'status']),
+    fields: table.fields, unique: table.unique, maxRecords: table.maxRecords
+  });
+}
+function sheetDbValidateData_(input) {
+  sheetDbAssert_(input && typeof input === 'object' && !Array.isArray(input), 'VALIDATION_ERROR', 'A complete record is required.');
+  const fields = sheetDbFields_(), data = {};
+  sheetDbAssert_(Object.keys(input).every(function (key) { return fields.some(function (field) { return field.name === key; }); }), 'VALIDATION_ERROR', 'The record contains unknown fields.');
+  fields.forEach(function (field) {
+    const value = input[field.name] === undefined ? '' : input[field.name];
+    if (value === '' && !field.required) { data[field.name] = ''; return; }
+    let valid;
+    if (field.type === 'integer') valid = Number.isSafeInteger(value);
+    else if (field.type === 'number') valid = typeof value === 'number' && Number.isFinite(value);
+    else if (field.type === 'boolean') valid = typeof value === 'boolean';
+    else valid = typeof value === 'string' && value.trim().length > 0 && value.length <= 500 && !value.startsWith('=');
+    if (valid && field.type === 'date') valid = /^\d{4}-\d{2}-\d{2}$/.test(value) && !isNaN(Date.parse(value + 'T00:00:00Z')) && new Date(value + 'T00:00:00Z').toISOString().slice(0, 10) === value;
+    if (valid && field.min !== undefined) valid = value >= field.min;
+    if (valid && field.max !== undefined) valid = value <= field.max;
+    if (valid && field.choices) valid = field.choices.indexOf(value) !== -1;
+    sheetDbAssert_(valid, 'VALIDATION_ERROR', 'Invalid value for ' + field.name + ' (' + field.type + ').', { field: field.name });
+    data[field.name] = value;
+  });
+  return data;
+}
+function sheetDbCondition_(data, condition) { return !condition || data[condition.field] === condition.equals; }
+function sheetDbCheckTables_(states, mark) {
+  const issues = [];
+  Object.keys(states).forEach(function (name) {
+    const state = states[name]; SHEET_DB_CURRENT_ = state.config;
+    state.rows.forEach(function (row) {
+      try {
+        sheetDbAssert_(!row.formula, 'VALIDATION_ERROR', 'Formulas are not supported.');
+        sheetDbValidateData_(row.data);
+        state.config.fields.forEach(function (field) {
+          if (!field.reference || !sheetDbCondition_(row.data, field.when) || row.data[field.name] === '') return;
+          sheetDbAssert_(states[field.reference].rows.some(function (target) { return target.id === row.data[field.name]; }), 'REFERENCE_CONFLICT', 'Referenced record does not exist: ' + field.name + '.');
+        });
+      } catch (error) { issues.push({ table: name, row: row.row, field: 'record', message: error.message }); }
+    });
+    state.config.unique.forEach(function (rule) {
+      const seen = Object.create(null);
+      state.rows.forEach(function (row) {
+        if (!sheetDbCondition_(row.data, rule.when)) return;
+        const key = JSON.stringify(rule.fields.map(function (field) { return row.data[field]; }));
+        if (seen[key]) issues.push({ table: name, row: row.row, field: rule.fields.join(', '), message: 'A unique value is already in use.' });
+        seen[key] = true;
+      });
+    });
+  });
+  if (mark && issues.length) issues.forEach(function (issue) {
+    const state = states[issue.table]; SHEET_DB_CURRENT_ = state.config;
+    try { state.storage.table.getRange(issue.row, state.config.headers.length).setValue('Needs attention'); } catch (_) {}
+  });
+  sheetDbAssert_(!issues.length, mark ? 'MANUAL_EDIT_INVALID' : 'CONSTRAINT_VIOLATION', 'The requested change violates the declared table rules.', { issues: issues });
+}
+function sheetDbValidateMutation_(storage, state, command) {
+  const targetConfig = sheetDbConfig_(), candidate = Object.assign({}, SHEET_DB_STATES_);
+  let rows = state.rows.filter(function (row) { return row.id !== command.recordId; });
+  if (command.action !== 'delete') rows = rows.concat([{ id: command.recordId, data: command.data, label: command.data, revision: command.expectedRevision + 1 || 1, row: state.byId[command.recordId] ? state.byId[command.recordId].row : Math.max(3, storage.table.getLastRow() + 1), formula: false }]);
+  candidate[targetConfig.sheetName] = Object.assign({}, candidate[targetConfig.sheetName], { rows: rows });
+  try {
+    Object.keys(SHEET_DB_STATES_).forEach(function (name) {
+      SHEET_DB_CURRENT_ = SHEET_DB_STATES_[name].config;
+      sheetDbStable_(SHEET_DB_STATES_[name].storage, SHEET_DB_STATES_[name].rows);
+    });
+    sheetDbCheckTables_(candidate, false);
+  } finally { SHEET_DB_CURRENT_ = targetConfig; }
+}
+function sheetDbTableRequest_(input) {
+  const lock = LockService.getDocumentLock();
+  sheetDbAssert_(lock && lock.tryLock(5000), 'BUSY', 'The database is busy. Retry the same request.');
+  try {
+    let schema = sheetDbLoadSchema_();
+    const ensure = input.action === 'ensureSchema';
+    if (ensure) {
+      sheetDbAllowed_(input, ['action', 'schema']);
+      const desired = sheetDbNormalizeSchema_(input.schema);
+      sheetDbAssert_(!schema || JSON.stringify(schema) === JSON.stringify(desired), 'SCHEMA_MISMATCH', 'This database has a different schema. Automatic schema migrations are not supported.');
+      if (!schema) PropertiesService.getDocumentProperties().setProperty('sheetdb.applicationSchema.v1', JSON.stringify(desired));
+      schema = desired;
+    }
+    sheetDbAssert_(schema, 'SCHEMA_REQUIRED', 'The app must declare its schema before accessing tables.');
+    const states = Object.create(null);
+    schema.tables.forEach(function (table) {
+      SHEET_DB_CURRENT_ = sheetDbTableConfig_(table);
+      const storage = sheetDbStorage_(); sheetDbRecover_(storage); sheetDbPrune_(storage);
+      states[table.name] = { config: SHEET_DB_CURRENT_, storage: storage, rows: sheetDbReadRows_(storage) };
+    });
+    sheetDbCheckTables_(states, true);
+    schema.tables.forEach(function (table) {
+      SHEET_DB_CURRENT_ = states[table.name].config;
+      Object.assign(states[table.name], sheetDbReconcile_(states[table.name].storage));
+    });
+    sheetDbCheckTables_(states, true);
+    if (ensure) return { result: { name: schema.name, version: schema.version, tables: schema.tables.map(function (table) { return table.name; }) } };
+    if (input.action === 'snapshot') return { result: Object.fromEntries(Object.keys(states).map(function (name) { return [name, states[name].rows.map(sheetDbRecord_)]; })) };
+    sheetDbAssert_(Object.prototype.hasOwnProperty.call(states, input.table), 'TABLE_NOT_FOUND', 'This table has not been declared by the app.');
+    const state = states[input.table]; SHEET_DB_CURRENT_ = state.config; SHEET_DB_STATES_ = states;
+    const raw = Object.assign({}, input); delete raw.table;
+    const command = sheetDbCommand_(raw); command.table = input.table;
+    if (command.action === 'list') return { result: state.rows.map(sheetDbRecord_) };
+    if (command.action === 'read') {
+      sheetDbAssert_(state.byId[command.recordId], 'NOT_FOUND', 'This record does not exist.');
+      return { result: sheetDbRecord_(state.byId[command.recordId]) };
+    }
+    return { result: sheetDbMutate_(state.storage, state, command) };
+  } finally { SHEET_DB_CURRENT_ = null; SHEET_DB_STATES_ = null; lock.releaseLock(); }
 }
