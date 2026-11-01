@@ -1,0 +1,26 @@
+{
+  "version": 4,
+  "assets": "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1",
+  "app": "sheet-db-dashboard",
+  "global": "__sveltekit_1nnc9wa",
+  "start": "_app/immutable/entry/start.CC_maCAi.js",
+  "appEntry": "_app/immutable/entry/app.Bsoc-0f3.js",
+  "styles": [],
+  "scripts": [],
+  "preloads": [
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/entry/start.CC_maCAi.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/chunks/Cf7Rw3Bo.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/chunks/CdRhd7kM.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/chunks/A69iIelq.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/entry/app.Bsoc-0f3.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/chunks/x3LUow8I.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/chunks/CXsg47WG.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/chunks/C0Icc_kW.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/chunks/L_hDDCpd.js",
+    "https://yissok.github.io/sheet-db-dashboard-dist/releases/93dbbd696fe3c15d15ea7a8efb0455da5eefcf0a-41287294101-1/_app/immutable/nodes/0.BZ42GpbI.js"
+  ],
+  "social": {
+    "title": "Sheet Db Dashboard",
+    "description": "An interactive website created with Project Factory."
+  }
+}

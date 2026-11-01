@@ -17,10 +17,18 @@ const SHEET_DB_PROOF_ = Object.freeze({
 
 let SHEET_DB_CURRENT_ = null;
 let SHEET_DB_STATES_ = null;
+// A spreadsheet-submit trigger supplies its own workbook; the panel uses the active one.
+let SHEET_DB_BOOK_ = null;
+function sheetDbBook_() { return SHEET_DB_BOOK_ || SpreadsheetApp.getActiveSpreadsheet(); }
 function sheetDbConfig_() { return SHEET_DB_CURRENT_ || SHEET_DB_PROOF_; }
 
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('sheet-db').addItem('Open connection panel', 'openSheetDbPanel').addToUi();
+  const menu = SpreadsheetApp.getUi().createMenu('sheet-db');
+  if (typeof sheetDbSetupFormsPoc === 'function') {
+    menu.addItem('Set up public Forms POC', 'sheetDbSetupFormsPoc')
+      .addItem('Show public connection details', 'sheetDbShowFormsConnection');
+  }
+  menu.addItem('Open connection panel', 'openSheetDbPanel').addToUi();
 }
 function openSheetDbPanel() {
   SpreadsheetApp.getUi().showSidebar(HtmlService.createHtmlOutputFromFile('Panel').setTitle('sheet-db connection'));
@@ -75,24 +83,29 @@ function sheetDbExecute(request) {
     sheetDbAssert_(session.accountId === identity.accountId && session.databaseId === identity.databaseId && request.context &&
       request.context.accountId === identity.accountId && request.context.databaseId === identity.databaseId,
       'IDENTITY_MISMATCH', 'The account or database changed. Reconnect before trying again.');
-    if (request.command && (request.command.action === 'ensureSchema' || request.command.table)) return sheetDbTableRequest_(request.command);
-    const command = sheetDbCommand_(request.command);
-    const lock = LockService.getDocumentLock();
-    sheetDbAssert_(lock && lock.tryLock(5000), 'BUSY', 'The database is busy. Retry the same request.', { retryable: true });
-    try {
-      const storage = sheetDbStorage_();
-      sheetDbRecover_(storage);
-      sheetDbPrune_(storage);
-      const state = sheetDbReconcile_(storage);
-      if (command.action === 'list') return { result: state.rows.map(sheetDbRecord_) };
-      if (command.action === 'read') {
-        const found = state.byId[command.recordId];
-        sheetDbAssert_(found, 'NOT_FOUND', 'This record does not exist.');
-        return { result: sheetDbRecord_(found) };
-      }
-      return { result: sheetDbMutate_(storage, state, command) };
-    } finally { lock.releaseLock(); }
+    return sheetDbExecuteCommand_(request.command);
   });
+}
+
+/** Trusted transports validate their context before entering the shared table engine. */
+function sheetDbExecuteCommand_(input) {
+  if (input && (input.action === 'ensureSchema' || input.table)) return sheetDbTableRequest_(input);
+  const command = sheetDbCommand_(input);
+  const lock = LockService.getDocumentLock();
+  sheetDbAssert_(lock && lock.tryLock(5000), 'BUSY', 'The database is busy. Retry the same request.', { retryable: true });
+  try {
+    const storage = sheetDbStorage_();
+    sheetDbRecover_(storage);
+    sheetDbPrune_(storage);
+    const state = sheetDbReconcile_(storage);
+    if (command.action === 'list') return { result: state.rows.map(sheetDbRecord_) };
+    if (command.action === 'read') {
+      const found = state.byId[command.recordId];
+      sheetDbAssert_(found, 'NOT_FOUND', 'This record does not exist.');
+      return { result: sheetDbRecord_(found) };
+    }
+    return { result: sheetDbMutate_(storage, state, command) };
+  } finally { lock.releaseLock(); }
 }
 
 function sheetDbIdentity_() {
@@ -100,7 +113,7 @@ function sheetDbIdentity_() {
   const active = String(Session.getActiveUser().getEmail() || '').trim().toLowerCase();
   sheetDbAssert_(effective && /^[^\s@]+@[^\s@]+$/.test(effective), 'IDENTITY_UNAVAILABLE', 'Google did not identify the authorized account. Use a browser profile signed into only the Sheet owner.');
   sheetDbAssert_(!active || active === effective, 'IDENTITY_MISMATCH', 'Google returned different active and authorized accounts. Use a browser profile signed into only the Sheet owner.');
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const spreadsheet = sheetDbBook_();
   sheetDbAssert_(spreadsheet, 'IDENTITY_UNAVAILABLE', 'Open this connector from its own Google Sheet.');
   return { accountId: effective, accountEmail: effective, databaseId: spreadsheet.getId(), databaseName: spreadsheet.getName(), protocolVersion: 2, schemaVersion: 2, connectorVersion: '0.3.0', tableApiVersion: 1 };
 }
@@ -138,7 +151,7 @@ function sheetDbCommand_(input) {
 }
 
 function sheetDbStorage_() {
-  const book = SpreadsheetApp.getActiveSpreadsheet();
+  const book = sheetDbBook_();
   sheetDbAssert_(!book.getSheetByName('_sheetdb_proof_v1'), 'UPGRADE_REQUIRED',
     'This Sheet contains the old audit journal. Keep it unchanged and install connector 0.2.0 in a new blank private Sheet. Automatic migration is not available.');
   let table = book.getSheetByName(sheetDbConfig_().sheetName), meta = book.getSheetByName(sheetDbConfig_().metaName), ops = book.getSheetByName(sheetDbConfig_().opsName);
