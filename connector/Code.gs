@@ -24,6 +24,7 @@ function sheetDbConfig_() { return SHEET_DB_CURRENT_ || SHEET_DB_PROOF_; }
 
 function onOpen() {
   const menu = SpreadsheetApp.getUi().createMenu('sheet-db');
+  if (typeof sheetDbOpenSetup === 'function') menu.addItem('Open setup', 'sheetDbOpenSetup');
   if (typeof sheetDbSetupFormsPoc === 'function') {
     menu.addItem('Set up public Forms POC', 'sheetDbSetupFormsPoc')
       .addItem('Show public connection details', 'sheetDbShowFormsConnection');
@@ -36,6 +37,7 @@ function openSheetDbPanel() {
 
 /** Best-effort marker only. A full reconciliation runs before every adapter request. */
 function onEdit(event) {
+  if (typeof sheetDbSetupOnEdit_ === 'function' && sheetDbSetupOnEdit_(event)) return;
   try {
     if (!event || !event.range) return;
     const name = event.range.getSheet().getName();
@@ -574,8 +576,8 @@ function sheetDbNormalizeSchema_(schema) {
   const names = Object.create(null);
   const tables = schema.tables.map(function (table) {
     sheetDbAllowed_(table, ['name', 'fields', 'unique', 'maxRecords']);
-    sheetDbAssert_(name(table.name) && !names[table.name.toLowerCase()] && Array.isArray(table.fields) && table.fields.length > 0 && table.fields.length <= 12,
-      'VALIDATION_ERROR', 'Table names must be distinct and have one to twelve fields.');
+    sheetDbAssert_(name(table.name) && table.name.toLowerCase() !== 'setup' && !names[table.name.toLowerCase()] && Array.isArray(table.fields) && table.fields.length > 0 && table.fields.length <= 12,
+      'VALIDATION_ERROR', 'Table names must be distinct, cannot use the reserved Setup tab, and must have one to twelve fields.');
     names[table.name.toLowerCase()] = true;
     const fields = table.fields.map(function (field) {
       sheetDbAllowed_(field, ['name', 'type', 'required', 'min', 'max', 'choices', 'reference', 'when']);

@@ -48,18 +48,29 @@ function sheetDbSetupFormsPoc() {
     'Form submissions and operation responses retain submitted data. Use disposable test data only. Continue?',
     ui.ButtonSet.YES_NO);
   if (answer !== ui.Button.YES) return;
-  const outcome = sheetDbSafe_(function () { return { result: sheetDbSetupFormsPoc_() }; });
+  const book = SpreadsheetApp.getActiveSpreadsheet(), confirmedId = book && book.getId();
+  const outcome = sheetDbSafe_(function () {
+    return { result: sheetDbSetupFormsPoc_(book, function () { return book && book.getId() === confirmedId; }) };
+  });
   if (outcome.error) { ui.alert(outcome.error.code + ': ' + outcome.error.message); return outcome; }
   sheetDbFormsShow_(outcome.result);
   return outcome;
 }
 
-function sheetDbSetupFormsPoc_() {
-  const book = SpreadsheetApp.getActiveSpreadsheet();
+function sheetDbSetupFormsPoc_(book, confirmPublicAccess) {
+  book = book || SpreadsheetApp.getActiveSpreadsheet();
   sheetDbAssert_(book, 'SETUP_REQUIRED', 'Run setup from the database spreadsheet.');
+  const confirmed = function () {
+    sheetDbAssert_(typeof confirmPublicAccess === 'function' && confirmPublicAccess() === true,
+      'PUBLIC_CONFIRMATION_REQUIRED', 'Confirm public access for this database before running setup.');
+  };
+  confirmed();
   const lock = LockService.getScriptLock();
   sheetDbAssert_(lock.tryLock(5000), 'BUSY', 'Setup is already running. Wait, then retry.');
+  const previousBook = SHEET_DB_BOOK_;
   try {
+    SHEET_DB_BOOK_ = book;
+    confirmed();
     const state = sheetDbFormsState_(book);
     const response = sheetDbFormsResponses_(book);
     // Initialize the normal readable records table without creating a panel session.
@@ -120,12 +131,14 @@ function sheetDbSetupFormsPoc_() {
     matching.slice(1).forEach(function (trigger) { ScriptApp.deleteTrigger(trigger); });
 
     // Sharing the Form permits respondents, not script editing. Account policy may reject this.
+    confirmed();
     DriveApp.getFileById(state.formId).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    confirmed();
     DriveApp.getFileById(book.getId()).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
     state.ready = true;
     sheetDbFormsSave_(state);
     return sheetDbFormsConfig_(book, state);
-  } finally { lock.releaseLock(); }
+  } finally { SHEET_DB_BOOK_ = previousBook; lock.releaseLock(); }
 }
 
 function sheetDbShowFormsConnection() {
